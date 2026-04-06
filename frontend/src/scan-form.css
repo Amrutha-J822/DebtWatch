@@ -1,0 +1,68 @@
+/* Scan tab — Aikido-style inputs: indigo + cyan accents, user-resizable textareas */
+
+.dw-scan-textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-width: 200px;
+  min-height: 44px;
+  padding: 0.65rem 0.85rem;
+  font-size: var(--font-size-3, 15px);
+  line-height: 1.45;
+  font-family: var(--default-font-family, ui-sans-serif, system-ui, sans-serif);
+  color: var(--gray-12, #1c2024);
+  background: #f9fafb;
+  border: 1px solid rgba(99, 102, 241, 0.22);
+  border-radius: 12px;
+  resize: both;
+  overflow: auto;
+  outline: none;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    background 0.15s ease;
+}
+
+.dw-scan-textarea::placeholder {
+  color: #9ca3af;
+}
+
+.dw-scan-textarea:hover {
+  border-color: rgba(34, 211, 238, 0.45);
+  background: #fff;
+}
+
+.dw-scan-textarea:focus-visible {
+  border-color: #22d3ee;
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.22);
+  background: #fff;
+}
+
+.dw-scan-textarea:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  resize: none;
+}
+
+/* Prompt: default taller so resize is obvious */
+.dw-scan-textarea--prompt {
+  min-height: 100px;
+}
+
+.radix-themes:where([data-is-root-theme='true']) .dw-scan-textarea {
+  color: var(--gray-12);
+}
+
+.radix-themes.dark .dw-scan-textarea {
+  background: rgba(15, 17, 20, 0.6);
+  color: var(--gray-12);
+  border-color: rgba(99, 102, 241, 0.35);
+}
+
+.radix-themes.dark .dw-scan-textarea:focus-visible {
+  background: rgba(15, 17, 20, 0.85);
+}
+
+.radix-themes.dark .dw-scan-textarea:hover {
+  border-color: rgba(34, 211, 238, 0.5);
+}

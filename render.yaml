@@ -1,0 +1,18 @@
+# Render Blueprint: deploy the DebtWatch API (Express).
+# 1) Push this repo to GitHub.
+# 2) In Render: New → Blueprint → connect repo → apply.
+# 3) In the Render dashboard, add all secret env vars (see backend/.env.example + README).
+# 4) After Vercel gives you a URL, set FRONTEND_URL on this service and redeploy.
+services:
+  - type: web
+    name: debtwatch-api
+    runtime: node
+    plan: free
+    region: oregon
+    rootDir: backend
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"

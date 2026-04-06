@@ -1,0 +1,81 @@
+# --- Dependencies ---
+node_modules/
+
+# --- Build outputs ---
+dist/
+dist-ssr/
+build/
+out/
+*.tsbuildinfo
+
+# --- Environment & secrets (never commit real credentials) ---
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets/
+credentials.json
+serviceAccount*.json
+*-credentials.json
+
+# --- Logs & debug ---
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Test & coverage ---
+coverage/
+.nyc_output/
+
+# --- Tooling caches ---
+.cache/
+.parcel-cache/
+.turbo/
+.vercel/
+.vite/
+.eslintcache
+.stylelintcache
+*.pid
+*.seed
+*.pid.lock
+
+# --- OS junk ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- Editors / IDEs ---
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+.vscode/*
+!.vscode/extensions.json
+
+# --- Temp & local scratch ---
+tmp/
+temp/
+*.tmp
+*.temp
+*.orig
+*.rej
+
+# Cursor local debug logs (keep .cursor/rules if you version them)
+.cursor/debug*.log

@@ -1,0 +1,11 @@
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+/* Radix Theme supplies typography and colors; keep globals minimal */
+body {
+  margin: 0;
+}
+
+#root {
+  min-height: 100dvh;
+}
