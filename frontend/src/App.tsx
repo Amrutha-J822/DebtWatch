@@ -106,6 +106,8 @@ interface Finding {
   context: string;
   verdict?: string;
   reason?: string;
+  /** Related modules (e.g. duplicate API endpoints) for multi-file fixes */
+  involvedFiles?: string[];
   /** Gemini: concrete remediation guidance */
   suggestedFix?: string;
 }

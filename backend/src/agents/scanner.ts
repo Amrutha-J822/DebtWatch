@@ -8,6 +8,8 @@ import {
   MAX_SCAN_FILE_BYTES,
   type RawFinding,
 } from './patternScan.js';
+import { discoverDuplicateApiFindings } from './duplicateApiDiscovery.js';
+import { capExtractedRoutes, extractRoutesFromFileContent, type ExtractedRoute } from './routeExtraction.js';
 import { isAllowedScanExtension } from '../upload/allowedExtensions.js';
 import { MAX_FILES_IN_ARCHIVE } from '../upload/limits.js';
 import { geminiReasoningText, geminiRepoInfographicStream } from '../utils/gemini.js';
@@ -313,6 +315,7 @@ async function runCredentialScan(
   const { owner, repo } = toRepoParts(repoFullName);
 
   const findings: RawFinding[] = [];
+  const routes: ExtractedRoute[] = [];
 
   const { data: repoMeta } = await octokit.rest.repos.get({ owner, repo });
   const { data: ref } = await octokit.rest.git.getRef({
@@ -349,10 +352,14 @@ async function runCredentialScan(
       if ((blob.size ?? 0) > MAX_SCAN_FILE_BYTES) continue;
       const content = Buffer.from(blob.content, 'base64').toString('utf-8');
       findings.push(...gatherFindingsForFileContent(file.path, content));
+      routes.push(...extractRoutesFromFileContent(file.path, content));
     } catch {
       continue;
     }
   }
+
+  const cappedRoutes = capExtractedRoutes(routes, 8000);
+  findings.push(...(await discoverDuplicateApiFindings(cappedRoutes)));
 
   fetch('http://127.0.0.1:7739/ingest/aa9c7ad1-d90c-453c-ae07-9977acb5e540', {
     method: 'POST',
@@ -375,7 +382,7 @@ async function runCredentialScan(
     );
   }
 
-  const paths = (reviewed as { file: string }[]).map((f) => f.file);
+  const paths = collectPathsForFindings(reviewed as Record<string, unknown>[]);
   const contentMap = await githubFileContentsMap(octokit, owner, repo, paths);
   reviewed = await enrichFindingsWithSuggestedFixes(reviewed as Record<string, unknown>[], contentMap);
 
@@ -417,6 +424,7 @@ async function localFileContentsMap(
 async function runLocalCredentialScan(rootDir: string, userQuery?: string): Promise<unknown[]> {
   const abs = path.resolve(rootDir);
   const findings: RawFinding[] = [];
+  const routes: ExtractedRoute[] = [];
 
   const files = await glob('**/*', {
     cwd: abs,
@@ -444,9 +452,13 @@ async function runLocalCredentialScan(rootDir: string, userQuery?: string): Prom
       continue;
     }
     findings.push(...gatherFindingsForFileContent(posixRel, content));
+    routes.push(...extractRoutesFromFileContent(posixRel, content));
     seenFiles += 1;
     if (seenFiles >= MAX_FILES_IN_ARCHIVE) break;
   }
+
+  const cappedRoutes = capExtractedRoutes(routes, 8000);
+  findings.push(...(await discoverDuplicateApiFindings(cappedRoutes)));
 
   let reviewed = await devilsAdvocate(findings as Record<string, unknown>[]);
   const q = userQuery?.trim().toLowerCase() ?? '';
@@ -455,9 +467,23 @@ async function runLocalCredentialScan(rootDir: string, userQuery?: string): Prom
       (f: { severity?: string }) => f.severity === 'CRITICAL' || f.severity === 'HIGH',
     );
   }
-  const paths = (reviewed as { file: string }[]).map((f) => f.file);
+  const paths = collectPathsForFindings(reviewed as Record<string, unknown>[]);
   const contentMap = await localFileContentsMap(abs, paths);
   return enrichFindingsWithSuggestedFixes(reviewed as Record<string, unknown>[], contentMap);
+}
+
+function collectPathsForFindings(findings: Record<string, unknown>[]): string[] {
+  const set = new Set<string>();
+  for (const f of findings) {
+    if (typeof f.file === 'string' && f.file) set.add(f.file);
+    const inv = f.involvedFiles;
+    if (Array.isArray(inv)) {
+      for (const p of inv) {
+        if (typeof p === 'string' && p.trim()) set.add(p.trim());
+      }
+    }
+  }
+  return [...set];
 }
 
 function extractJsonArray(text: string): string {
@@ -483,6 +509,8 @@ FALSE_POSITIVE only if clearly safe or unrelated.
 
 For type "Auth TODO": REAL if the TODO mentions secrets, tokens, OAuth, rotation, credentials, PATs, JWT, or auth work. FALSE_POSITIVE only if the TODO is unrelated to security (e.g. generic refactor with no auth context).
 
+For category "Architecture" (duplicate HTTP routes, redundant API endpoints): REAL when the routes clearly duplicate the same registration or the same business behavior. FALSE_POSITIVE only when the comparison is wrong (different operations, bad extraction, or unrelated routes).
+
 Findings: ${JSON.stringify(findings, null, 2)}
 
 Return ONLY a JSON array (same objects, plus verdict and reason on each). No markdown, no commentary.`,
@@ -492,7 +520,16 @@ Return ONLY a JSON array (same objects, plus verdict and reason on each). No mar
   try {
     const parsed = JSON.parse(extractJsonArray(raw));
     if (!Array.isArray(parsed)) return findings;
-    return parsed.filter((f: { verdict?: string }) => f.verdict === 'REAL');
+    const keyOf = (f: Record<string, unknown>) =>
+      `${String(f.file ?? '')}:${String(f.line ?? '')}:${String(f.type ?? '')}`;
+    const origByKey = new Map(findings.map((f) => [keyOf(f), f]));
+
+    return parsed
+      .filter((f: { verdict?: string }) => f.verdict === 'REAL')
+      .map((p: Record<string, unknown>) => {
+        const base = origByKey.get(keyOf(p));
+        return base ? { ...base, ...p } : p;
+      });
   } catch {
     return findings;
   }

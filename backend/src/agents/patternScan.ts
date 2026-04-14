@@ -10,7 +10,8 @@ export type FindingCategory =
   | 'Auth'
   | 'Deserialization'
   | 'Config'
-  | 'Dependency';
+  | 'Dependency'
+  | 'Architecture';
 
 export type RawFinding = {
   type: string;
@@ -20,6 +21,8 @@ export type RawFinding = {
   line: number;
   match: string;
   context: string;
+  /** When a finding spans multiple modules (e.g. duplicate APIs), include paths for fix suggestions. */
+  involvedFiles?: string[];
 };
 
 export const SECRET_PATTERNS: { name: string; regex: RegExp; severity: FindingSeverity }[] = [

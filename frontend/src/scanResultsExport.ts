@@ -18,6 +18,7 @@ export type ScanFindingForExport = {
   context: string;
   verdict?: string;
   reason?: string;
+  involvedFiles?: string[];
   suggestedFix?: string;
 };
 
@@ -80,6 +81,7 @@ export function buildScanResultsDocumentHtml(options: {
   <h2 style="font-size:14pt;margin:0 0 0.35rem 0;">${i + 1}. ${escapeHtml(f.type)} <span style="color:#64748b;font-weight:normal;">(${escapeHtml(f.severity)})</span></h2>
   <p style="margin:0.25rem 0;"><strong>File:</strong> ${escapeHtml(f.file)} — line ${f.line}</p>
   ${f.category ? `<p style="margin:0.25rem 0;"><strong>Category:</strong> ${escapeHtml(f.category)}</p>` : ''}
+  ${f.involvedFiles?.length ? `<p style="margin:0.25rem 0;"><strong>Related files:</strong> ${escapeHtml(f.involvedFiles.join(', '))}</p>` : ''}
   <p style="margin:0.25rem 0;"><strong>Match:</strong> <code>${escapeHtml(f.match)}</code></p>
   <p style="margin:0.25rem 0;"><strong>Context:</strong></p>
   <pre style="white-space:pre-wrap;font-family:Consolas,monospace;font-size:10pt;background:#f1f5f9;padding:0.5rem;border-radius:4px;">${escapeHtml(f.context?.trim() ? f.context : '(none)')}</pre>
@@ -121,6 +123,7 @@ function buildScanResultsPlainText(options: {
         `${i + 1}. ${f.type} (${f.severity})`,
         `   File: ${f.file} — line ${f.line}`,
         f.category ? `   Category: ${f.category}` : '',
+        f.involvedFiles?.length ? `   Related files: ${f.involvedFiles.join(', ')}` : '',
         `   Match: ${f.match}`,
         '   Context:',
         f.context?.trim() ? f.context.split('\n').map((l) => `     ${l}`).join('\n') : '     (none)',
