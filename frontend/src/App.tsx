@@ -1,5 +1,12 @@
 import { useAuth0 } from '@auth0/auth0-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type InputHTMLAttributes,
+} from 'react';
 import axios, { isAxiosError } from 'axios';
 import { auth0AppBaseUrl } from './auth0AppUrls';
 import debtwatchLogoUrl from './assets/debtwatch-logo.png';
@@ -8,6 +15,8 @@ import { MarkdownExplanation } from './MarkdownExplanation';
 import { ThemeToggle } from './ThemeToggle';
 import { APPEARANCE_STORAGE_KEY, readStoredAppearance, type Appearance } from './appearance';
 import { formatClientCatchError, formatUserFacingError } from './userFacingError';
+import { copyRepoOverviewToClipboard, downloadRepoOverviewPdf } from './explainOverviewExport';
+import { copyScanResultsToClipboard, downloadScanResultsPdf } from './scanResultsExport';
 import './dashboard-layout.css';
 import './scan-form.css';
 import {
@@ -97,6 +106,8 @@ interface Finding {
   context: string;
   verdict?: string;
   reason?: string;
+  /** Gemini: concrete remediation guidance */
+  suggestedFix?: string;
 }
 
 function severityBadgeColor(s: Severity): 'red' | 'orange' | 'yellow' | 'gray' {
@@ -275,7 +286,44 @@ function VulnerabilitySeverityLineChart({
   );
 }
 
-function FindingCard({ finding }: { finding: Finding }) {
+function CopyOverviewIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      aria-hidden
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  );
+}
+
+function CheckOverviewIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      aria-hidden
+      fill="none"
+      stroke="var(--green-11)"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
+  );
+}
+
+function FindingCard({ finding, isDark }: { finding: Finding; isDark: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const sev = finding.severity;
   const badgeColor = severityBadgeColor(sev);
@@ -376,6 +424,31 @@ function FindingCard({ finding }: { finding: Finding }) {
                 Devil&apos;s Advocate: {finding.reason}
               </Text>
             ) : null}
+            {finding.suggestedFix ? (
+              <Box mt="4">
+                <Text
+                  size="1"
+                  weight="medium"
+                  color="gray"
+                  mb="2"
+                  style={{ textTransform: 'uppercase' }}
+                >
+                  Suggested fix
+                </Text>
+                <Box
+                  p="3"
+                  style={{
+                    borderRadius: 'var(--radius-3)',
+                    border: '1px solid var(--cyan-a6)',
+                    background: 'var(--cyan-a2)',
+                    maxHeight: 320,
+                    overflowY: 'auto',
+                  }}
+                >
+                  <MarkdownExplanation markdown={finding.suggestedFix} isDark={isDark} />
+                </Box>
+              </Box>
+            ) : null}
           </Box>
         </>
       )}
@@ -407,12 +480,21 @@ export default function App() {
   // Email + Docs features removed by request.
 
   const [scanQuery, setScanQuery] = useState('');
+  const [scanSource, setScanSource] = useState<'github' | 'zip' | 'folder'>('github');
+  const [zipFile, setZipFile] = useState<File | null>(null);
+  const [folderFiles, setFolderFiles] = useState<FileList | null>(null);
+  const zipInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const [scanExplanation, setScanExplanation] = useState('');
   const [scanVisualExplanation, setScanVisualExplanation] = useState<{
     mimeType: string;
     dataBase64: string;
   } | null>(null);
   const [scanMode, setScanMode] = useState<'scan' | 'explain' | null>(null);
+  const [overviewCopyDone, setOverviewCopyDone] = useState(false);
+  const [overviewPdfLoading, setOverviewPdfLoading] = useState(false);
+  const [scanCopyDone, setScanCopyDone] = useState(false);
+  const [scanPdfLoading, setScanPdfLoading] = useState(false);
   const [avatarBroken, setAvatarBroken] = useState(false);
 
   const auth0DefaultScope = 'openid profile email';
@@ -553,14 +635,126 @@ export default function App() {
    * Scan uses Token Vault when signed in: sends the Auth0 API access JWT (audience) so the backend
    * can exchange it for the user's GitHub token. Without it, GitHub REST uses anonymous rate limits.
    */
-  const scan = async () => {
-    if (!repo.trim()) return;
+  const getApiAccessToken = async (): Promise<string | null> => {
+    const audience = import.meta.env.VITE_AUTH0_AUDIENCE?.trim();
+    try {
+      const accessToken = await getAccessTokenSilently(
+        audience ? { authorizationParams: { audience } } : undefined,
+      );
+      return accessToken || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const scanUpload = async () => {
+    if (scanSource === 'zip' && !zipFile) return;
+    if (scanSource === 'folder' && !folderFiles?.length) return;
+
+    const token = await getApiAccessToken();
+    if (!token) {
+      setError('Sign in and ensure your session can request an API access token (Auth0 audience).');
+      return;
+    }
     setLoading(true);
     setError('');
     setScanned(false);
     setScanExplanation('');
     setScanVisualExplanation(null);
     setScanMode(null);
+    setOverviewCopyDone(false);
+    setScanCopyDone(false);
+
+    const fd = new FormData();
+    fd.append('query', scanQuery.trim());
+    let historyLabel = 'upload';
+
+    try {
+      if (scanSource === 'zip') {
+        fd.append('archive', zipFile!, zipFile!.name);
+        historyLabel = `zip:${zipFile!.name}`;
+      } else {
+        const list = folderFiles!;
+        const first = list[0] as File & { webkitRelativePath?: string };
+        const root =
+          first.webkitRelativePath?.split(/[/\\]/)[0] ?? first.name ?? 'folder';
+        historyLabel = `folder:${root}`;
+        for (let i = 0; i < list.length; i++) {
+          const f = list[i] as File & { webkitRelativePath?: string };
+          const rel = f.webkitRelativePath || f.name;
+          fd.append('files', f, rel);
+        }
+      }
+
+      const { data } = await axios.post<{
+        findings: Finding[];
+        mode?: 'scan' | 'explain';
+        explanation?: string;
+        visualExplanation?: { mimeType: string; dataBase64: string };
+      }>(`${API_BASE}/api/scan/upload`, fd, {
+        timeout: SCAN_HTTP_TIMEOUT_MS,
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const mode = data.mode ?? 'scan';
+      setScanMode(mode);
+      if (mode === 'explain') {
+        setScanExplanation(data.explanation ?? '');
+        setScanVisualExplanation(data.visualExplanation ?? null);
+        setFindings([]);
+      } else {
+        setFindings(data.findings ?? []);
+        appendScanHistory(historyLabel, (data.findings ?? []) as Finding[]);
+      }
+      setScanned(true);
+    } catch (e: unknown) {
+      setError(
+        formatClientCatchError(
+          e,
+          'Upload scan failed. Check file size limits and that the backend is running.',
+        ),
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCopyRepoOverview = async () => {
+    try {
+      await copyRepoOverviewToClipboard({
+        markdown: scanExplanation ?? '',
+        image: scanVisualExplanation ?? undefined,
+      });
+      setOverviewCopyDone(true);
+      window.setTimeout(() => setOverviewCopyDone(false), 3000);
+    } catch {
+      setError('Could not copy to the clipboard. Your browser may block clipboard access.');
+    }
+  };
+
+  const handleDownloadOverviewPdf = () => {
+    setOverviewPdfLoading(true);
+    try {
+      downloadRepoOverviewPdf({
+        markdown: scanExplanation ?? '',
+        image: scanVisualExplanation ?? undefined,
+      });
+    } catch {
+      setError('Could not generate PDF. Try again or use Copy.');
+    } finally {
+      setOverviewPdfLoading(false);
+    }
+  };
+
+  const scan = async () => {
+    if (scanSource !== 'github' || !repo.trim()) return;
+    setLoading(true);
+    setError('');
+    setScanned(false);
+    setScanExplanation('');
+    setScanVisualExplanation(null);
+    setScanMode(null);
+    setOverviewCopyDone(false);
+    setScanCopyDone(false);
 
     const repoInput = repo.trim();
     const repoNormalized = /^https?:\/\//i.test(repoInput)
@@ -695,6 +889,61 @@ export default function App() {
     HIGH: findings.filter((f) => f.severity === 'HIGH').length,
     MEDIUM: findings.filter((f) => f.severity === 'MEDIUM').length,
     LOW: findings.filter((f) => f.severity === 'LOW').length,
+  };
+
+  const scanExportLabel = useMemo(() => {
+    if (scanSource === 'github' && repo.trim()) {
+      const ri = repo.trim();
+      return /^https?:\/\//i.test(ri) ? ri : ri.replace(/\s+/g, '/').replace(/\/+/g, '/');
+    }
+    if (scanSource === 'zip' && zipFile) return `Zip: ${zipFile.name}`;
+    if (scanSource === 'folder' && folderFiles?.length) {
+      const first = folderFiles[0] as File & { webkitRelativePath?: string };
+      const root = first.webkitRelativePath?.split(/[/\\]/)[0] ?? first.name ?? 'folder';
+      return `Folder: ${root}`;
+    }
+    return 'Scan target';
+  }, [scanSource, repo, zipFile, folderFiles]);
+
+  const handleCopyScanResults = async () => {
+    try {
+      await copyScanResultsToClipboard({
+        targetLabel: scanExportLabel,
+        findings,
+        summary: {
+          total: findings.length,
+          critical: counts.CRITICAL,
+          high: counts.HIGH,
+          medium: counts.MEDIUM,
+          low: counts.LOW,
+        },
+      });
+      setScanCopyDone(true);
+      window.setTimeout(() => setScanCopyDone(false), 3000);
+    } catch {
+      setError('Could not copy to the clipboard. Your browser may block clipboard access.');
+    }
+  };
+
+  const handleDownloadScanPdf = () => {
+    setScanPdfLoading(true);
+    try {
+      downloadScanResultsPdf({
+        targetLabel: scanExportLabel,
+        findings,
+        summary: {
+          total: findings.length,
+          critical: counts.CRITICAL,
+          high: counts.HIGH,
+          medium: counts.MEDIUM,
+          low: counts.LOW,
+        },
+      });
+    } catch {
+      setError('Could not generate PDF. Try again or use Copy.');
+    } finally {
+      setScanPdfLoading(false);
+    }
   };
 
   const greetingName = useMemo(() => {
@@ -840,28 +1089,116 @@ export default function App() {
                     style={{ width: '100%', maxWidth: 520, overflow: 'visible' }}
                   >
                     <Flex direction="column" gap="4" align="stretch">
-                      <Flex direction="column" gap="2" align="start" style={{ width: '100%' }}>
-                        <Text as="label" size="2" weight="medium" htmlFor="repo" highContrast>
-                          Repository
-                        </Text>
-                        <textarea
-                          id="repo"
-                          className="dw-scan-textarea"
-                          rows={2}
-                          placeholder="owner/repo or GitHub URL"
-                          value={repo}
-                          onChange={(e) => setRepo(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' && !e.shiftKey) {
-                              e.preventDefault();
-                              scan();
-                            }
-                          }}
-                          disabled={isLoading}
-                          autoComplete="off"
-                          spellCheck={false}
-                        />
+                      <Text size="2" color="gray">
+                        Check a GitHub repo, or upload a zip or local folder (requires sign-in; files are
+                        scanned on the server then deleted).
+                      </Text>
+                      <Flex gap="2" wrap="wrap" role="group" aria-label="Source type">
+                        <Button
+                          size="2"
+                          type="button"
+                          variant={scanSource === 'github' ? 'solid' : 'soft'}
+                          onClick={() => setScanSource('github')}
+                        >
+                          GitHub repo
+                        </Button>
+                        <Button
+                          size="2"
+                          type="button"
+                          variant={scanSource === 'zip' ? 'solid' : 'soft'}
+                          onClick={() => setScanSource('zip')}
+                        >
+                          Zip file
+                        </Button>
+                        <Button
+                          size="2"
+                          type="button"
+                          variant={scanSource === 'folder' ? 'solid' : 'soft'}
+                          onClick={() => setScanSource('folder')}
+                        >
+                          Folder
+                        </Button>
                       </Flex>
+
+                      {scanSource === 'github' ? (
+                        <Flex direction="column" gap="2" align="start" style={{ width: '100%' }}>
+                          <Text as="label" size="2" weight="medium" htmlFor="repo" highContrast>
+                            Repository
+                          </Text>
+                          <textarea
+                            id="repo"
+                            className="dw-scan-textarea"
+                            rows={2}
+                            placeholder="owner/repo or GitHub URL"
+                            value={repo}
+                            onChange={(e) => setRepo(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                scan();
+                              }
+                            }}
+                            disabled={isLoading}
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                        </Flex>
+                      ) : null}
+
+                      {scanSource === 'zip' ? (
+                        <Flex direction="column" gap="2" align="start" style={{ width: '100%' }}>
+                          <input
+                            ref={zipInputRef}
+                            type="file"
+                            accept=".zip,application/zip"
+                            style={{ display: 'none' }}
+                            onChange={(e) => setZipFile(e.target.files?.[0] ?? null)}
+                          />
+                          <Flex gap="2" align="center" wrap="wrap">
+                            <Button
+                              size="2"
+                              type="button"
+                              variant="outline"
+                              onClick={() => zipInputRef.current?.click()}
+                            >
+                              Choose .zip
+                            </Button>
+                            <Text size="2" color="gray" style={{ wordBreak: 'break-all' }}>
+                              {zipFile ? zipFile.name : 'No file selected'}
+                            </Text>
+                          </Flex>
+                        </Flex>
+                      ) : null}
+
+                      {scanSource === 'folder' ? (
+                        <Flex direction="column" gap="2" align="start" style={{ width: '100%' }}>
+                          <input
+                            ref={folderInputRef}
+                            type="file"
+                            style={{ display: 'none' }}
+                            multiple
+                            {...({
+                              webkitdirectory: '',
+                            } as InputHTMLAttributes<HTMLInputElement>)}
+                            onChange={(e) => setFolderFiles(e.target.files)}
+                          />
+                          <Flex gap="2" align="center" wrap="wrap">
+                            <Button
+                              size="2"
+                              type="button"
+                              variant="outline"
+                              onClick={() => folderInputRef.current?.click()}
+                            >
+                              Choose folder
+                            </Button>
+                            <Text size="2" color="gray">
+                              {folderFiles?.length
+                                ? `${folderFiles.length} file(s) selected`
+                                : 'No folder selected'}
+                            </Text>
+                          </Flex>
+                        </Flex>
+                      ) : null}
 
                       <Flex direction="column" gap="2" align="start" style={{ width: '100%' }}>
                         <Text as="label" size="2" weight="medium" htmlFor="scanQuery" highContrast>
@@ -882,11 +1219,26 @@ export default function App() {
                         size="3"
                         variant="solid"
                         color="indigo"
-                        disabled={loading || !repo.trim() || isLoading}
-                        onClick={scan}
+                        disabled={
+                          loading ||
+                          isLoading ||
+                          (scanSource === 'github' && !repo.trim()) ||
+                          (scanSource === 'zip' && !zipFile) ||
+                          (scanSource === 'folder' && !folderFiles?.length) ||
+                          ((scanSource === 'zip' || scanSource === 'folder') && !isAuthenticated)
+                        }
+                        onClick={() => {
+                          if (scanSource === 'github') void scan();
+                          else void scanUpload();
+                        }}
                         style={{
                           borderRadius: 12,
-                          cursor: loading || !repo.trim() || isLoading ? 'not-allowed' : 'pointer',
+                          cursor:
+                            loading ||
+                            isLoading ||
+                            ((scanSource === 'zip' || scanSource === 'folder') && !isAuthenticated)
+                              ? 'not-allowed'
+                              : 'pointer',
                         }}
                       >
                         {loading ? (
@@ -898,6 +1250,11 @@ export default function App() {
                           'Scan'
                         )}
                       </Button>
+                      {(scanSource === 'zip' || scanSource === 'folder') && !isAuthenticated ? (
+                        <Text size="1" color="orange">
+                          Sign in to upload and scan local files.
+                        </Text>
+                      ) : null}
                     </Flex>
                   </Card>
 
@@ -912,29 +1269,63 @@ export default function App() {
                       {scanMode === 'explain' ? (
                         scanExplanation || scanVisualExplanation ? (
                           <Box className="dw-explain-card">
-                            <Text size="2" weight="bold" highContrast mb="3">
-                              Repository overview
-                            </Text>
-                            {scanVisualExplanation ? (
-                              <Box mb="3" className="dw-visual-frame">
-                                <img
-                                  src={`data:${scanVisualExplanation.mimeType};base64,${scanVisualExplanation.dataBase64}`}
-                                  alt="Visual summary of the repository generated by Gemini"
-                                  style={{
-                                    width: '100%',
-                                    height: 'auto',
-                                    display: 'block',
-                                    verticalAlign: 'top',
-                                  }}
+                            <Box className="dw-explain-capture-root">
+                              <Flex justify="between" align="center" gap="3" mb="3" wrap="wrap">
+                                <Text size="2" weight="bold" highContrast>
+                                  Repository overview
+                                </Text>
+                                <Flex gap="2" align="center">
+                                  <Button
+                                    type="button"
+                                    size="2"
+                                    variant="ghost"
+                                    color="gray"
+                                    aria-label={overviewCopyDone ? 'Copied' : 'Copy overview'}
+                                    onClick={() => void handleCopyRepoOverview()}
+                                    style={{ minWidth: 36, color: overviewCopyDone ? 'var(--green-11)' : undefined }}
+                                  >
+                                    {overviewCopyDone ? <CheckOverviewIcon /> : <CopyOverviewIcon />}
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="2"
+                                    variant="soft"
+                                    color="cyan"
+                                    disabled={overviewPdfLoading}
+                                    onClick={handleDownloadOverviewPdf}
+                                  >
+                                    {overviewPdfLoading ? (
+                                      <Flex align="center" gap="2">
+                                        <Spinner size="1" />
+                                        Preparing PDF…
+                                      </Flex>
+                                    ) : (
+                                      'Download as PDF'
+                                    )}
+                                  </Button>
+                                </Flex>
+                              </Flex>
+                              {scanVisualExplanation ? (
+                                <Box mb="3" className="dw-visual-frame">
+                                  <img
+                                    src={`data:${scanVisualExplanation.mimeType};base64,${scanVisualExplanation.dataBase64}`}
+                                    alt="Visual summary of the repository generated by Gemini"
+                                    style={{
+                                      width: '100%',
+                                      height: 'auto',
+                                      display: 'block',
+                                      verticalAlign: 'top',
+                                    }}
+                                  />
+                                </Box>
+                              ) : null}
+                              {scanExplanation ? (
+                                <MarkdownExplanation
+                                  markdown={scanExplanation}
+                                  isDark={appearance === 'dark'}
                                 />
-                              </Box>
-                            ) : null}
-                            {scanExplanation ? (
-                              <MarkdownExplanation
-                                markdown={scanExplanation}
-                                isDark={appearance === 'dark'}
-                              />
-                            ) : null}
+                              ) : null}
+                            </Box>
                           </Box>
                         ) : (
                           <Callout.Root color="gray" style={{ width: '100%' }}>
@@ -972,9 +1363,42 @@ export default function App() {
                                     after Devil&apos;s Advocate review
                                   </Text>
                                 </Flex>
-                                <Badge size="2" color="cyan" variant="solid" highContrast>
-                                  {findings.length}
-                                </Badge>
+                                <Flex gap="2" align="center" wrap="wrap">
+                                  <Button
+                                    type="button"
+                                    size="2"
+                                    variant="ghost"
+                                    color="gray"
+                                    aria-label={scanCopyDone ? 'Copied' : 'Copy scan results'}
+                                    onClick={() => void handleCopyScanResults()}
+                                    style={{
+                                      minWidth: 36,
+                                      color: scanCopyDone ? 'var(--green-11)' : undefined,
+                                    }}
+                                  >
+                                    {scanCopyDone ? <CheckOverviewIcon /> : <CopyOverviewIcon />}
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="2"
+                                    variant="soft"
+                                    color="cyan"
+                                    disabled={scanPdfLoading}
+                                    onClick={handleDownloadScanPdf}
+                                  >
+                                    {scanPdfLoading ? (
+                                      <Flex align="center" gap="2">
+                                        <Spinner size="1" />
+                                        Preparing PDF…
+                                      </Flex>
+                                    ) : (
+                                      'Download as PDF'
+                                    )}
+                                  </Button>
+                                  <Badge size="2" color="cyan" variant="solid" highContrast>
+                                    {findings.length}
+                                  </Badge>
+                                </Flex>
                               </Flex>
                               <Separator size="4" />
                               <Grid columns={{ initial: '2', sm: '4' }} gap="4" width="100%">
@@ -990,7 +1414,13 @@ export default function App() {
                             {(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const).flatMap((sev) =>
                               findings
                                 .filter((f) => f.severity === sev)
-                                .map((f, i) => <FindingCard key={`${sev}-${i}`} finding={f} />),
+                                .map((f, i) => (
+                                  <FindingCard
+                                    key={`${sev}-${i}`}
+                                    finding={f}
+                                    isDark={appearance === 'dark'}
+                                  />
+                                )),
                             )}
                           </Flex>
                         </>

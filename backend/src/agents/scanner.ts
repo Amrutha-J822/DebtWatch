@@ -1,107 +1,17 @@
 import '../env.js';
+import { readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { Octokit } from '@octokit/rest';
+import { glob } from 'glob';
+import {
+  gatherFindingsForFileContent,
+  MAX_SCAN_FILE_BYTES,
+  type RawFinding,
+} from './patternScan.js';
+import { isAllowedScanExtension } from '../upload/allowedExtensions.js';
+import { MAX_FILES_IN_ARCHIVE } from '../upload/limits.js';
 import { geminiReasoningText, geminiRepoInfographicStream } from '../utils/gemini.js';
-
-type FindingSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM';
-type FindingCategory =
-  | 'Secrets'
-  | 'Injection'
-  | 'XSS'
-  | 'Command Execution'
-  | 'Crypto'
-  | 'Auth'
-  | 'Deserialization'
-  | 'Config'
-  | 'Dependency';
-
-type RawFinding = {
-  type: string;
-  category: FindingCategory;
-  severity: FindingSeverity;
-  file: string;
-  line: number;
-  match: string;
-  context: string;
-};
-
-// Secret patterns (generic — no path or repo-specific strings)
-const SECRET_PATTERNS: { name: string; regex: RegExp; severity: FindingSeverity }[] = [
-  { name: 'Slack token', regex: /xox[bpsa]-[0-9A-Za-z\-]{10,48}/g, severity: 'CRITICAL' },
-  { name: 'GitHub PAT', regex: /ghp_[A-Za-z0-9]{36}/g, severity: 'CRITICAL' },
-  { name: 'GitHub OAuth / fine-grained token', regex: /\bgho_[A-Za-z0-9_]{36,}\b|\bghu_[A-Za-z0-9_]{36,}\b|\bghs_[A-Za-z0-9_]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, severity: 'CRITICAL' },
-  { name: 'OpenAI key', regex: /sk-[a-zA-Z0-9]{48}/g, severity: 'CRITICAL' },
-  { name: 'AWS key', regex: /AKIA[0-9A-Z]{16}/g, severity: 'CRITICAL' },
-  {
-    name: 'OAuth client_secret in config',
-    regex: /["']client_secret["']\s*:\s*["']([^"'\\\n]{12,})["']/gi,
-    severity: 'HIGH',
-  },
-  {
-    name: 'Generic high-entropy secret value',
-    regex: /["'](secret|client_secret|api_secret|password|api_key|access_token|refresh_token)["']\s*:\s*["']([^"'\\\n]{16,})["']/gi,
-    severity: 'HIGH',
-  },
-  {
-    name: 'Generic secret assignment',
-    regex: /["'](secret|token|password|api_key)["']\s*[:=]\s*["']([A-Za-z0-9+/=_-]{16,})["']/gi,
-    severity: 'HIGH',
-  },
-];
-
-const VULN_PATTERNS: { name: string; regex: RegExp; severity: FindingSeverity; category: FindingCategory }[] = [
-  {
-    name: 'Potential SQL injection (raw concatenated query)',
-    regex: /\b(select|update|insert|delete)\b[\s\S]{0,120}(\+|\$\{|\breq\.(query|params|body)\b)/gi,
-    severity: 'CRITICAL',
-    category: 'Injection',
-  },
-  {
-    name: 'Potential reflected/stored XSS sink',
-    regex: /\b(innerHTML|outerHTML|document\.write)\b[\s\S]{0,120}(req\.(query|params|body)|location\.search|\+)/gi,
-    severity: 'HIGH',
-    category: 'XSS',
-  },
-  {
-    name: 'Command execution with dynamic input',
-    regex: /\b(exec|execSync|spawn|spawnSync)\s*\([\s\S]{0,120}(\+|\$\{|req\.(query|params|body))/gi,
-    severity: 'CRITICAL',
-    category: 'Command Execution',
-  },
-  {
-    name: 'Unsafe deserialization/load',
-    regex: /\b(pickle\.loads|yaml\.load\(|java\.io\.ObjectInputStream|BinaryFormatter)\b/gi,
-    severity: 'HIGH',
-    category: 'Deserialization',
-  },
-  {
-    name: 'Weak crypto hash/signature',
-    regex: /\b(md5|sha1)\b/gi,
-    severity: 'MEDIUM',
-    category: 'Crypto',
-  },
-  {
-    name: 'Insecure JWT/crypto verification option',
-    regex: /\b(jwt\.verify|verify)\b[\s\S]{0,100}(ignoreExpiration|none|allowInsecureKeySizes)/gi,
-    severity: 'HIGH',
-    category: 'Auth',
-  },
-  {
-    name: 'Permissive CORS + credentials',
-    regex: /\bcors\s*\([\s\S]{0,180}(origin\s*:\s*['"`]\*['"`]|origin\s*:\s*true)[\s\S]{0,120}credentials\s*:\s*true/gi,
-    severity: 'HIGH',
-    category: 'Config',
-  },
-  {
-    name: 'Known vulnerability note in docs/readme',
-    regex: /\b(sql injection|cross[\s-]?site scripting|xss|command injection|rce|path traversal)\b/gi,
-    severity: 'HIGH',
-    category: 'Dependency',
-  },
-];
-
-/** Security-related TODOs (avoid bare "key" → false positives like "monkey") */
-const AUTH_TODO_KEYWORDS =
-  /(oauth|credential|secret|password|jwt|bearer|rotate|client_secret|access_token|refresh_token|api[_-]?key|apikey|authorization|\bpat\b|\bauth\b|\btoken\b)/i;
+import { enrichFindingsWithSuggestedFixes } from '../utils/geminiSuggestedFixes.js';
 
 function inferMode(userQuery: string | undefined): 'explain' | 'security' {
   const q = (userQuery ?? '').trim().toLowerCase();
@@ -116,21 +26,6 @@ function inferMode(userQuery: string | undefined): 'explain' | 'security' {
     return 'explain';
   }
   return 'security';
-}
-
-/** JS/TS/C-style // TODO and Python/shell # TODO */
-function lineHasAuthTodo(line: string): boolean {
-  const trimmed = line.trim();
-  const todo =
-    /^\s*\/\/\s*TODO\b/i.test(line) ||
-    /^#\s*TODO\b/i.test(trimmed) ||
-    /\bTODO\b/i.test(line);
-  return todo && AUTH_TODO_KEYWORDS.test(line);
-}
-
-function lineIndexContaining(lines: string[], needle: string): number {
-  const i = lines.findIndex((l) => l.includes(needle));
-  return i >= 0 ? i + 1 : 1;
 }
 
 export type ScanResponse =
@@ -185,6 +80,26 @@ export async function scanRepository(
     };
   }
   const findings = await runCredentialScan(repoFullName, githubToken, options?.userQuery);
+  return { mode: 'scan', findings };
+}
+
+/** Scan a local directory tree (uploaded zip/folder), same modes as GitHub. */
+export async function scanUploadWorkspace(
+  rootDir: string,
+  options?: { userQuery?: string },
+): Promise<ScanResponse> {
+  const abs = path.resolve(rootDir);
+  const route = inferMode(options?.userQuery);
+  if (route === 'explain') {
+    const { explanation, visualExplanation } = await explainLocalProject(abs, options?.userQuery ?? '');
+    return {
+      mode: 'explain',
+      findings: [],
+      explanation,
+      ...(visualExplanation ? { visualExplanation } : {}),
+    };
+  }
+  const findings = await runLocalCredentialScan(abs, options?.userQuery);
   return { mode: 'scan', findings };
 }
 
@@ -274,6 +189,121 @@ You may include brief supporting text in the model response, but the infographic
   };
 }
 
+async function explainLocalProject(
+  rootDir: string,
+  userQuery: string,
+): Promise<{
+  explanation: string;
+  visualExplanation?: { mimeType: string; dataBase64: string };
+}> {
+  const label = path.basename(rootDir);
+  let readmeSnippet = '';
+  for (const name of ['README.md', 'README', 'readme.md', 'Readme.md']) {
+    try {
+      const p = path.join(rootDir, name);
+      readmeSnippet = await readFile(p, 'utf8');
+      break;
+    } catch {
+      /* try next */
+    }
+  }
+  if (!readmeSnippet) readmeSnippet = '(No README found in upload.)';
+  readmeSnippet = readmeSnippet.slice(0, 14_000);
+
+  let pkgHint = '';
+  try {
+    const raw = await readFile(path.join(rootDir, 'package.json'), 'utf8');
+    pkgHint = raw.slice(0, 4000);
+  } catch {
+    pkgHint = '';
+  }
+
+  const fileList = await glob('**/*', {
+    cwd: rootDir,
+    nodir: true,
+    dot: true,
+    ignore: ['**/node_modules/**'],
+  });
+  const topDirs = [...new Set(fileList.map((f) => f.split(/[/\\]/)[0]).filter(Boolean))].slice(0, 24);
+
+  const prompt = `You help a developer understand a **local codebase** uploaded for review (not necessarily on GitHub).
+
+Project folder: ${label}
+Detected top-level paths (sample): ${topDirs.join(', ') || 'n/a'}
+${pkgHint ? `\npackage.json (truncated):\n${pkgHint}\n` : ''}
+
+README (truncated):
+${readmeSnippet}
+
+User request: ${userQuery.trim() || 'Give a clear overview of what this project does, suggested architecture/workflow in Markdown, and security considerations.'}
+
+Respond in Markdown with sections:
+## Overview
+## Architecture & workflows (use mermaid code fences for 1–2 diagrams where helpful)
+## Security / credentials angle
+## Suggested next steps
+Keep it structured and practical.`;
+
+  const infographicPrompt = `You create one high-impact infographic for software developers: clean sans-serif typography, strong visual hierarchy, generous whitespace, readable labels.
+
+Local project folder: ${label}
+README (ground truth):
+${readmeSnippet.slice(0, 8000)}
+
+User request: ${userQuery.trim() || 'Explain this codebase and visualize workflows and structure.'}
+
+Generate exactly ONE polished landscape infographic summarizing purpose, main structure, and workflows. Stay faithful to README and listed files; do not invent features.`;
+
+  const [explanation, infographicOutcome] = await Promise.all([
+    geminiReasoningText(prompt, { maxTokens: 8192 }),
+    geminiRepoInfographicStream(infographicPrompt).catch((e) => {
+      console.warn(
+        '[explain local] infographic:',
+        e instanceof Error ? e.message : String(e),
+      );
+      return { text: '', image: null };
+    }),
+  ]);
+
+  if (!infographicOutcome.image) {
+    return { explanation };
+  }
+  return {
+    explanation,
+    visualExplanation: {
+      mimeType: infographicOutcome.image.mimeType,
+      dataBase64: infographicOutcome.image.dataBase64,
+    },
+  };
+}
+
+async function githubFileContentsMap(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  paths: string[],
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const unique = [...new Set(paths)];
+  for (const filePath of unique) {
+    try {
+      const { data } = await octokit.rest.repos.getContent({
+        owner,
+        repo,
+        path: filePath,
+      });
+      if (Array.isArray(data) || !('content' in data)) continue;
+      if (data.encoding !== 'base64' || !data.content) continue;
+      const buf = Buffer.from(data.content, 'base64');
+      if (buf.length > MAX_SCAN_FILE_BYTES) continue;
+      map.set(filePath, buf.toString('utf8'));
+    } catch {
+      continue;
+    }
+  }
+  return map;
+}
+
 async function runCredentialScan(
   repoFullName: string,
   githubToken: string | undefined,
@@ -316,81 +346,14 @@ async function runCredentialScan(
         file_sha: file.sha,
       });
 
-      if ((blob.size ?? 0) > 350_000) continue;
+      if ((blob.size ?? 0) > MAX_SCAN_FILE_BYTES) continue;
       const content = Buffer.from(blob.content, 'base64').toString('utf-8');
-      const lines = content.split('\n');
-
-      for (const pattern of SECRET_PATTERNS) {
-        const re = new RegExp(pattern.regex.source, pattern.regex.flags);
-        let m: RegExpExecArray | null;
-        const seen = new Set<string>();
-        while ((m = re.exec(content)) !== null) {
-          const full = m[0];
-          const lineNum = lineIndexContaining(lines, full);
-          const dedupeKey = `${lineNum}:${full}`;
-          if (seen.has(dedupeKey)) continue;
-          seen.add(dedupeKey);
-          const ctxStart = Math.max(0, lineNum - 3);
-          const ctxEnd = Math.min(lines.length, lineNum + 2);
-          const context = lines.slice(ctxStart, ctxEnd).join('\n');
-
-          findings.push({
-            type: pattern.name,
-            category: 'Secrets',
-            severity: pattern.severity,
-            file: file.path,
-            line: lineNum,
-            match: full.length > 48 ? `${full.slice(0, 48)}…` : full,
-            context,
-          });
-        }
-      }
-
-      for (const pattern of VULN_PATTERNS) {
-        const re = new RegExp(pattern.regex.source, pattern.regex.flags);
-        let m: RegExpExecArray | null;
-        const seen = new Set<string>();
-        while ((m = re.exec(content)) !== null) {
-          const full = m[0];
-          const lineNum = lineIndexContaining(lines, full);
-          const dedupeKey = `${lineNum}:${full}`;
-          if (seen.has(dedupeKey)) continue;
-          seen.add(dedupeKey);
-          const ctxStart = Math.max(0, lineNum - 3);
-          const ctxEnd = Math.min(lines.length, lineNum + 2);
-          const context = lines.slice(ctxStart, ctxEnd).join('\n');
-
-          findings.push({
-            type: pattern.name,
-            category: pattern.category,
-            severity: pattern.severity,
-            file: file.path,
-            line: lineNum,
-            match: full.length > 64 ? `${full.slice(0, 64)}…` : full,
-            context,
-          });
-        }
-      }
-
-      lines.forEach((lineText, idx) => {
-        if (!lineHasAuthTodo(lineText)) return;
-        const lineNum = idx + 1;
-        findings.push({
-          type: 'Auth TODO',
-          category: 'Auth',
-          severity: 'MEDIUM',
-          file: file.path,
-          line: lineNum,
-          match: lineText.trim().slice(0, 80),
-          context: lineText,
-        });
-      });
+      findings.push(...gatherFindingsForFileContent(file.path, content));
     } catch {
       continue;
     }
   }
 
-  // #region agent log
   fetch('http://127.0.0.1:7739/ingest/aa9c7ad1-d90c-453c-ae07-9977acb5e540', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '1623b3' },
@@ -403,7 +366,6 @@ async function runCredentialScan(
       timestamp: Date.now(),
     }),
   }).catch(() => {});
-  // #endregion
 
   let reviewed = await devilsAdvocate(findings as Record<string, unknown>[]);
   const q = userQuery?.trim().toLowerCase() ?? '';
@@ -412,7 +374,11 @@ async function runCredentialScan(
       (f: { severity?: string }) => f.severity === 'CRITICAL' || f.severity === 'HIGH',
     );
   }
-  // #region agent log
+
+  const paths = (reviewed as { file: string }[]).map((f) => f.file);
+  const contentMap = await githubFileContentsMap(octokit, owner, repo, paths);
+  reviewed = await enrichFindingsWithSuggestedFixes(reviewed as Record<string, unknown>[], contentMap);
+
   fetch('http://127.0.0.1:7739/ingest/aa9c7ad1-d90c-453c-ae07-9977acb5e540', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '1623b3' },
@@ -425,8 +391,73 @@ async function runCredentialScan(
       timestamp: Date.now(),
     }),
   }).catch(() => {});
-  // #endregion
   return reviewed;
+}
+
+async function localFileContentsMap(
+  rootDir: string,
+  paths: string[],
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  for (const rel of new Set(paths)) {
+    const safe = rel.replace(/\\/g, '/');
+    const abs = path.join(rootDir, safe);
+    if (!abs.startsWith(path.resolve(rootDir))) continue;
+    try {
+      const buf = await readFile(abs);
+      if (buf.length > MAX_SCAN_FILE_BYTES) continue;
+      map.set(safe, buf.toString('utf8'));
+    } catch {
+      continue;
+    }
+  }
+  return map;
+}
+
+async function runLocalCredentialScan(rootDir: string, userQuery?: string): Promise<unknown[]> {
+  const abs = path.resolve(rootDir);
+  const findings: RawFinding[] = [];
+
+  const files = await glob('**/*', {
+    cwd: abs,
+    nodir: true,
+    dot: true,
+    ignore: ['**/node_modules/**', '**/.git/**'],
+  });
+
+  let seenFiles = 0;
+  for (const rel of files) {
+    const posixRel = rel.split(path.sep).join('/');
+    if (!isAllowedScanExtension(posixRel)) continue;
+    const full = path.join(abs, rel);
+    let st;
+    try {
+      st = await stat(full);
+    } catch {
+      continue;
+    }
+    if (!st.isFile() || st.size > MAX_SCAN_FILE_BYTES) continue;
+    let content: string;
+    try {
+      content = await readFile(full, 'utf8');
+    } catch {
+      continue;
+    }
+    findings.push(...gatherFindingsForFileContent(posixRel, content));
+    seenFiles += 1;
+    if (seenFiles >= MAX_FILES_IN_ARCHIVE) break;
+  }
+
+  let reviewed = await devilsAdvocate(findings as Record<string, unknown>[]);
+  const q = userQuery?.trim().toLowerCase() ?? '';
+  if (q && /\bcritical\b|\bhigh\b|\bvulnerabilit|\bexploit\b|\brce\b/i.test(q)) {
+    reviewed = reviewed.filter(
+      (f: { severity?: string }) => f.severity === 'CRITICAL' || f.severity === 'HIGH',
+    );
+  }
+  const paths = (reviewed as { file: string }[]).map((f) => f.file);
+  const contentMap = await localFileContentsMap(abs, paths);
+  return enrichFindingsWithSuggestedFixes(reviewed as Record<string, unknown>[], contentMap);
 }
 
 function extractJsonArray(text: string): string {

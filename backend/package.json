@@ -26,14 +26,19 @@
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
     "express-oauth2-jwt-bearer": "^1.7.4",
+    "express-rate-limit": "^8.3.2",
     "glob": "^13.0.6",
     "googleapis": "^171.4.0",
-    "simple-git": "^3.33.0"
+    "multer": "^2.1.1",
+    "simple-git": "^3.33.0",
+    "yauzl": "^3.3.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/multer": "^2.1.0",
     "@types/node": "^25.5.2",
+    "@types/yauzl": "^2.10.3",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",

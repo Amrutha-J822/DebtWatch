@@ -2,9 +2,10 @@
  * Single source of truth for Auth0 login `redirect_uri` and logout `returnTo`.
  * Must match Allowed Callback URLs and Allowed Logout URLs exactly (Auth0 compares strings).
  *
- * Dev: set `VITE_AUTH0_REDIRECT_URI=http://localhost:5173` so login works even if you opened
- * the tab as `http://127.0.0.1:5173` (those are different origins — whitelist both in Auth0
- * if you need both, or use localhost only).
+ * Dev: set `VITE_AUTH0_REDIRECT_URI` to your SPA origin (e.g. `http://localhost:5173` with default
+ * Vite) so login works even if you opened the tab
+ * with `127.0.0.1` instead of `localhost` — those are different origins; whitelist both in Auth0
+ * if you need both, or use one host only.
  */
 export function auth0AppBaseUrl(): string {
   const explicit = import.meta.env.VITE_AUTH0_REDIRECT_URI?.trim();

@@ -2,9 +2,11 @@ import './env.js';
 import express from 'express';
 import cors from 'cors';
 import scanRouter from './routes/scan.js';
+import uploadScanRouter from './routes/uploadScan.js';
 import { appendDebugLine, peekJwtAud } from './debugSessionLog.js';
 
 const app = express();
+app.set('trust proxy', 1);
 
 const extraOrigins =
   process.env.CORS_ORIGINS?.split(',')
@@ -85,6 +87,7 @@ app.get('/api/meta', (_req, res) => {
 });
 
 app.use('/api', scanRouter);
+app.use('/api', uploadScanRouter);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
